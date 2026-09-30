@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -16,6 +17,7 @@ from .models import (
     Batch,
     BatchReview,
     IdempotencyKey,
+    MaterialReservation,
     Production,
     ProductionCancellation,
     ProductionInput,
@@ -24,9 +26,38 @@ from .schemas import (
     ProductionCancellationIn,
     ProductionIn,
     RawBatchIn,
+    ReservationCancelIn,
+    ReservationIn,
     ReviewIn,
     SuspectIn,
 )
+
+
+# ---------------------------------------------------------------- 时间支持
+
+
+def utcnow() -> datetime:
+    """服务端当前时间（UTC，aware）。预留到期一律以此为准。"""
+    return datetime.now(timezone.utc)
+
+
+def _is_sqlite(session: Session) -> bool:
+    return session.get_bind().dialect.name == "sqlite"
+
+
+def _store_dt(session: Session, value: datetime) -> datetime:
+    """落库时间归一化：PostgreSQL 保留 aware UTC；SQLite 无原生 tz，
+    统一存 naive UTC，读取时再补 tzinfo，保证两侧比较都在同一时区基准上。"""
+    value = value.astimezone(timezone.utc)
+    return value.replace(tzinfo=None) if _is_sqlite(session) else value
+
+
+def _read_dt(session: Session, value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 # ---------------------------------------------------------------- 幂等支持
 
@@ -180,15 +211,254 @@ def _acquire_qc_lock(session: Session) -> None:
         session.execute(text("LOCK TABLE batches IN SHARE ROW EXCLUSIVE MODE"))
 
 
+# ---------------------------------------------------------------- 预留额度
+
+
+def _active_reserved_totals(
+    session: Session, batch_nos: list[str], *, now: datetime | None = None
+) -> dict[str, Decimal]:
+    """各批次“仍占额度”的预留合计：未取消、未核销且未到期。
+
+    到期按服务端当前时间（UTC）即时判定，不做后台扫描，到期即释放额度。
+    """
+    if not batch_nos:
+        return {}
+    current = _store_dt(session, now or utcnow())
+    rows = session.execute(
+        select(
+            MaterialReservation.source_no,
+            func.coalesce(func.sum(MaterialReservation.qty), 0),
+        )
+        .where(MaterialReservation.source_no.in_(batch_nos))
+        .where(MaterialReservation.status == "active")
+        .where(MaterialReservation.expires_at > current)
+        .group_by(MaterialReservation.source_no)
+    ).all()
+    return {source: Decimal(total) for source, total in rows}
+
+
+def _active_reserved_total(
+    session: Session, batch_no: str, *, now: datetime | None = None
+) -> Decimal:
+    return _active_reserved_totals(session, [batch_no], now=now).get(batch_no, Decimal(0))
+
+
+def batch_availability(
+    session: Session,
+    batch: Batch,
+    *,
+    reserved: Decimal | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """组装某批次实存/预留/可用额度；可用量绝不为负（写事务内强制约束）。"""
+    if reserved is None:
+        reserved = _active_reserved_total(session, batch.batch_no, now=now)
+    available = batch.remaining_qty - reserved
+    return {
+        "batch_no": batch.batch_no,
+        "unit": batch.unit,
+        "remaining_qty": batch.remaining_qty,
+        "reserved_qty": reserved,
+        "available_qty": available,
+        "is_quarantined": batch.is_quarantined,
+    }
+
+
+def _lock_reservation(
+    session: Session, reservation_no: str
+) -> MaterialReservation | None:
+    stmt = select(MaterialReservation).where(
+        MaterialReservation.reservation_no == reservation_no
+    )
+    if session.get_bind().dialect.name == "postgresql":
+        stmt = stmt.with_for_update()
+    return session.execute(stmt).scalar_one_or_none()
+
+
+def reservation_status(
+    reservation: MaterialReservation, *, session: Session, now: datetime
+) -> str:
+    """展示/校验状态：active 记录在 expires_at 到期后即时呈现为 expired。"""
+    if reservation.status == "active":
+        expires = _read_dt(session, reservation.expires_at)
+        if expires is not None and expires <= now:
+            return "expired"
+    return reservation.status
+
+
+def _reservation_dict(
+    session: Session,
+    reservation: MaterialReservation,
+    *,
+    now: datetime,
+    source: Batch | None = None,
+    availability: dict[str, Any] | None = None,
+    output_map: dict[int, str] | None = None,
+) -> dict[str, Any]:
+    source_batch = source or session.get(Batch, reservation.source_no)
+    if availability is None:
+        availability = batch_availability(session, source_batch, now=now)
+    consumed_output_no: str | None = None
+    if reservation.consumed_production_id is not None:
+        if output_map is not None:
+            consumed_output_no = output_map.get(reservation.consumed_production_id)
+        if consumed_output_no is None:
+            prod = session.get(Production, reservation.consumed_production_id)
+            consumed_output_no = prod.output_no if prod is not None else None
+    return {
+        "reservation_no": reservation.reservation_no,
+        "source_batch_no": reservation.source_no,
+        "unit": reservation.unit,
+        "quantity": reservation.qty,
+        "expires_at": _read_dt(session, reservation.expires_at),
+        "status": reservation_status(reservation, session=session, now=now),
+        "created_at": _read_dt(session, reservation.created_at),
+        "cancelled_at": _read_dt(session, reservation.cancelled_at),
+        "cancel_reason": reservation.cancel_reason,
+        "consumed_at": _read_dt(session, reservation.consumed_at),
+        "consumed_by_output_no": consumed_output_no,
+        "source": availability,
+    }
+
+
+def create_reservation(session: Session, data: ReservationIn) -> dict[str, Any]:
+    """登记一笔原料预留。
+
+    预留不改变实存余量；同一事务内先锁来源批次行（与生产投料同一加锁层级，
+    全局按编号升序，杜绝死锁），再核对：
+    1. 截止时间严格晚于服务端当前时间；
+    2. 来源批次存在且未作废（隔离批次可预留，隔离只禁核销、不禁占额度）；
+    3. 申报单位与来源批次一致；
+    4. 实存 - 未取消/未核销/未到期预留 >= 本次预留量（可用量不足整笔拒绝）；
+    5. 预留单号唯一（唯一约束兜底并发首请求竞争）。
+    任一不符整笔拒绝，无部分预留。
+    """
+    now = utcnow()
+    if data.expires_at <= now:
+        raise errors.deadline_not_future(data.expires_at)
+
+    batch = _lock_batch(session, data.source_batch_no)
+    if batch is None:
+        raise errors.batch_not_found(data.source_batch_no)
+
+    if data.source_batch_no in cancelled_output_nos(session, [data.source_batch_no]):
+        raise errors.batch_cancelled(data.source_batch_no)
+    if batch.unit != data.unit:
+        raise errors.unit_mismatch(data.source_batch_no, batch.unit, data.unit)
+
+    reserved = _active_reserved_total(session, data.source_batch_no, now=now)
+    available = batch.remaining_qty - reserved
+    if data.quantity > available:
+        raise errors.insufficient_available(
+            data.source_batch_no, data.quantity, available
+        )
+
+    reservation = MaterialReservation(
+        reservation_no=data.reservation_no,
+        source_no=data.source_batch_no,
+        unit=data.unit,
+        qty=data.quantity,
+        expires_at=_store_dt(session, data.expires_at),
+        status="active",
+    )
+    session.add(reservation)
+    try:
+        session.flush()
+    except IntegrityError:
+        raise errors.reservation_exists(data.reservation_no) from None
+
+    # 本笔预留已计入“仍占额度”合计
+    availability = batch_availability(
+        session, batch, reserved=reserved + data.quantity, now=now
+    )
+    return _reservation_dict(
+        session, reservation, now=now, source=batch, availability=availability
+    )
+
+
+def get_reservation(session: Session, reservation_no: str) -> dict[str, Any]:
+    reservation = session.get(MaterialReservation, reservation_no)
+    if reservation is None:
+        raise errors.reservation_not_found(reservation_no)
+    source = session.get(Batch, reservation.source_no)
+    return _reservation_dict(session, reservation, now=utcnow(), source=source)
+
+
+def list_reservations(session: Session, batch_no: str) -> dict[str, Any]:
+    """查询某来源批次的全部预留（含已取消/已核销/已到期）与各状态及当前可用量。"""
+    batch = session.get(Batch, batch_no)
+    if batch is None:
+        raise errors.batch_not_found(batch_no)
+    now = utcnow()
+    rows = session.execute(
+        select(MaterialReservation)
+        .where(MaterialReservation.source_no == batch_no)
+        .order_by(MaterialReservation.created_at, MaterialReservation.reservation_no)
+    ).scalars().all()
+    availability = batch_availability(session, batch, now=now)
+    return {
+        "source_batch_no": batch_no,
+        "availability": availability,
+        "reservations": [
+            _reservation_dict(
+                session,
+                r,
+                now=now,
+                source=batch,
+                availability=availability,
+            )
+            for r in rows
+        ],
+    }
+
+
+def cancel_reservation(
+    session: Session, reservation_no: str, data: ReservationCancelIn | None = None
+) -> dict[str, Any]:
+    """主动取消预留：仅“未取消、未核销且未到期”的预留可取消。
+
+    取消即时释放额度（不再计入可用量的扣减项）。取消与预留登记、按预留投料
+    共用同一加锁顺序（先锁来源批次行，再锁预留行），并发结局等价于某一串行
+    顺序。过期/已取消/已核销整笔拒绝。
+    """
+    now = utcnow()
+    reservation = session.get(MaterialReservation, reservation_no)
+    if reservation is None:
+        raise errors.reservation_not_found(reservation_no)
+
+    # 先锁来源批次，再锁预留行——与 create_reservation / submit_production
+    # 的加锁方向一致，避免“预留锁→批次锁”与“批次锁→预留锁”形成死锁环
+    source = _lock_batch(session, reservation.source_no)
+    reservation = _lock_reservation(session, reservation_no)
+    assert reservation is not None
+
+    status = reservation_status(reservation, session=session, now=now)
+    if status != "active":
+        raise errors.reservation_not_active(reservation_no, status)
+
+    reason = (data.reason.strip() if data and data.reason else "操作员主动取消")
+    reservation.status = "cancelled"
+    reservation.cancel_reason = reason
+    reservation.cancelled_at = _store_dt(session, now)
+    session.flush()
+
+    return _reservation_dict(session, reservation, now=now, source=source)
+
+
 def submit_production(session: Session, data: ProductionIn) -> Production:
     """提交一次生产：校验全部通过后才扣减余量并创建产出批次。
 
-    校验顺序（任一失败整笔拒绝、不改变余量）：
+    校验顺序（任一失败整笔拒绝、不改变余量、不占用产出编号）：
     1. 投入明细编号不重复；
-    2. 每个来源批次存在、单位一致、未隔离；
-    3. 产出编号未被占用；
-    4. 每笔用量为正且不超过该批次余量；
-    5. 产出总量不超过投入总量。
+    2. 每个来源批次存在、单位一致、未隔离、未作废；
+    3. 若携带 reservation_no：预留存在且为 active（未取消/未核销/未到期、
+       来源未隔离未作废），且投料批次、数量、单位与预留**完全一致**（仅一笔投料）；
+    4. 产出编号未被占用；
+    5. 普通生产（不带预留）每笔用量不超过该批次**可用量**
+       （可用量 = 实存 - 未取消/未核销/未到期预留）；
+    6. 产出总量不超过投入总量。
+
+    通过后在同一事务内核销预留（active -> consumed）、扣减实存、生成产出。
     """
     source_nos = [item.batch_no for item in data.inputs]
     if len(set(source_nos)) != len(source_nos):
@@ -198,16 +468,33 @@ def submit_production(session: Session, data: ProductionIn) -> Production:
             422,
         )
 
+    now = utcnow()
+    # 先（无锁）读取预留以确定其来源批次，随后把“投料来源 + 预留来源”一并
+    # 按编号升序加锁，最后再锁预留行——保持全局统一的“批次锁→预留锁”顺序。
+    reservation: MaterialReservation | None = None
+    if data.reservation_no is not None:
+        reservation = session.get(MaterialReservation, data.reservation_no)
+        if reservation is None:
+            raise errors.reservation_not_found(data.reservation_no)
+        lock_nos = sorted(set(source_nos) | {reservation.source_no})
+    else:
+        lock_nos = source_nos
+
     sources: dict[str, Batch] = {}
     total_input = Decimal("0")
     # 先按编号排序一次性锁定所有来源批次，避免并发事务交叉加锁死锁
     # （PostgreSQL 行锁；SQLite 为立即写锁）
-    locked = _lock_batches_in_order(session, source_nos)
+    locked = _lock_batches_in_order(session, lock_nos)
     for no in source_nos:
         batch = locked.get(no)
         if batch is None:
             raise errors.batch_not_found(no)
         sources[no] = batch
+
+    # 预留行在全部批次锁之后再加锁
+    if reservation is not None:
+        reservation = _lock_reservation(session, data.reservation_no)
+        assert reservation is not None
 
     for item in data.inputs:
         batch = sources[item.batch_no]
@@ -218,20 +505,72 @@ def submit_production(session: Session, data: ProductionIn) -> Production:
 
     # 已撤销生产单的产出编号永久保留但不得再投料（与 QC 锁串行化，
     # 撤销事务取 QC 表锁，因此这里读到的“有效/已撤销”状态与最终一致）
-    cancelled_nos = cancelled_output_nos(session, source_nos)
+    cancelled_set = cancelled_output_nos(session, lock_nos)
     for item in data.inputs:
-        if item.batch_no in cancelled_nos:
+        if item.batch_no in cancelled_set:
             raise errors.batch_cancelled(item.batch_no)
+
+    # 按预留投料校验：未取消/未核销/未到期；来源未隔离未作废；
+    # 投料批次、数量、单位与预留完全一致（仅一笔投料）
+    if reservation is not None:
+        status = reservation_status(reservation, session=session, now=now)
+        if status != "active":
+            raise errors.reservation_not_active(data.reservation_no, status)
+        reserved_source = locked.get(reservation.source_no)
+        if reserved_source is None:
+            raise errors.batch_not_found(reservation.source_no)
+        if reservation.source_no in cancelled_set:
+            raise errors.batch_cancelled(reservation.source_no)
+        if reserved_source.is_quarantined:
+            raise errors.batch_quarantined(reservation.source_no)
+        # 投料批次、数量和单位须与预留完全一致：按预留核销只允许单笔投料
+        if len(data.inputs) != 1:
+            raise errors.reservation_mismatch(
+                data.reservation_no, "投料笔数", 1, len(data.inputs)
+            )
+        item = data.inputs[0]
+        if item.batch_no != reservation.source_no:
+            raise errors.reservation_mismatch(
+                data.reservation_no,
+                "source_batch_no",
+                reservation.source_no,
+                item.batch_no,
+            )
+        if item.quantity != reservation.qty:
+            raise errors.reservation_mismatch(
+                data.reservation_no, "quantity", reservation.qty, item.quantity
+            )
+        if data.unit != reservation.unit:
+            raise errors.reservation_mismatch(
+                data.reservation_no, "unit", reservation.unit, data.unit
+            )
 
     if session.get(Batch, data.output_batch_no) is not None:
         raise errors.batch_exists(data.output_batch_no)
 
+    # 实存/可用量校验：普通生产只能消耗可用量（预留占用的额度不得被普通生产超用）；
+    # 按预留核销时数量与预留严格相等，预留有效即保证 available >= qty，
+    # 仍以实存兜底核对，绝不让余量为负。
+    if reservation is None:
+        reserved_totals = _active_reserved_totals(session, source_nos, now=now)
     for item in data.inputs:
         batch = sources[item.batch_no]
-        if item.quantity > batch.remaining_qty:
-            raise errors.insufficient(
-                item.batch_no, item.quantity, batch.remaining_qty
-            )
+        if reservation is not None:
+            if item.quantity > batch.remaining_qty:
+                raise errors.insufficient(
+                    item.batch_no, item.quantity, batch.remaining_qty
+                )
+        else:
+            available = batch.remaining_qty - reserved_totals.get(item.batch_no, Decimal(0))
+            # 兼容既有错误码：普通生产超用（此时先受可用量约束）仍报
+            # INSUFFICIENT_BALANCE，仅在消息中体现可用量口径
+            if item.quantity > available:
+                exc = errors.insufficient(item.batch_no, item.quantity, available)
+                exc.message = (
+                    f"批次 {item.batch_no!r} 可用量不足：请求 {item.quantity}，"
+                    f"当前可用 {available}（可用量 = 实存余量 - 未取消且未到期的预留）"
+                )
+                raise exc
         total_input += item.quantity
 
     if data.output_quantity > total_input:
@@ -274,6 +613,12 @@ def submit_production(session: Session, data: ProductionIn) -> Production:
                 qty=item.quantity,
             )
         )
+
+    # 同事务核销预留：占用额度随实存扣减一并解除（consumed 不再计入预留合计）
+    if reservation is not None:
+        reservation.status = "consumed"
+        reservation.consumed_production_id = production.id
+        reservation.consumed_at = _store_dt(session, now)
 
     session.flush()
     # 重新加载聚合，便于响应组装
@@ -457,6 +802,21 @@ def cancel_production(
 
     # 产出逻辑作废：编号/原单据保留，余量清零，永不再投料
     output.remaining_qty = 0
+
+    # 产出作废旧仍占额度的预留（active 且未到期）随之在同一事务内自动取消，
+    # 避免“作废批次余量 0 却仍有预留占额”导致可用量为负；已核销/已取消的不动。
+    now = utcnow()
+    active_reservations = session.execute(
+        select(MaterialReservation).where(
+            MaterialReservation.source_no == output_no,
+            MaterialReservation.status == "active",
+            MaterialReservation.expires_at > _store_dt(session, now),
+        )
+    ).scalars().all()
+    for rv in active_reservations:
+        rv.status = "cancelled"
+        rv.cancel_reason = f"来源批次 {output_no} 随生产单撤销作废，预留自动取消"
+        rv.cancelled_at = _store_dt(session, now)
 
     record = ProductionCancellation(
         production_id=prod.id, cancel_reason=data.cancel_reason.strip()

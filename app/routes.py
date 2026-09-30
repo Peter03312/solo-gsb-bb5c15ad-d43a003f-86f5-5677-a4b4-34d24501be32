@@ -20,6 +20,10 @@ from .schemas import (
     ProductionIn,
     ProductionOut,
     RawBatchIn,
+    ReservationCancelIn,
+    ReservationIn,
+    ReservationListOut,
+    ReservationOut,
     ReviewIn,
     ReviewOut,
     SuspectIn,
@@ -28,12 +32,21 @@ from .schemas import (
 router = APIRouter()
 
 
-def _batch_out(batch: Batch, cancelled: bool = False) -> dict[str, Any]:
+def _batch_out(
+    batch: Batch,
+    session: Session,
+    cancelled: bool = False,
+    availability: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if availability is None:
+        availability = service.batch_availability(session, batch)
     return {
         "batch_no": batch.batch_no,
         "unit": batch.unit,
         "initial_qty": float(batch.initial_qty),
         "remaining_qty": float(batch.remaining_qty),
+        "available_qty": float(availability["available_qty"]),
+        "reserved_qty": float(availability["reserved_qty"]),
         "is_suspect": batch.is_suspect,
         "is_quarantined": batch.is_quarantined,
         "is_cancelled": cancelled,
@@ -77,7 +90,7 @@ def create_raw_batch(
 
     def action() -> tuple[int, dict[str, Any]]:
         batch = service.register_raw_batch(session, body)
-        return status.HTTP_201_CREATED, _batch_out(batch)
+        return status.HTTP_201_CREATED, _batch_out(batch, session)
 
     code, result = service.idempotent(
         session,
@@ -187,7 +200,99 @@ def get_batch(batch_no: str, session: SessionDep) -> dict[str, Any]:
 
         raise batch_not_found(batch_no)
     cancelled = batch_no in service.cancelled_output_nos(session, [batch_no])
-    return _batch_out(batch, cancelled)
+    return _batch_out(batch, session, cancelled)
+
+
+@router.get(
+    "/batches/{batch_no}/reservations",
+    response_model=ReservationListOut,
+)
+def list_batch_reservations(batch_no: str, session: SessionDep) -> dict[str, Any]:
+    """查询某来源批次的全部预留（各状态）与当前实存/预留/可用量。"""
+    return service.list_reservations(session, batch_no)
+
+
+@router.get("/reservations/{reservation_no}", response_model=ReservationOut)
+def get_reservation(reservation_no: str, session: SessionDep) -> dict[str, Any]:
+    """查询单笔预留状态及其来源批次当前可用量。"""
+    return service.get_reservation(session, reservation_no)
+
+
+@router.post(
+    "/reservations",
+    response_model=ReservationOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_reservation(
+    body: ReservationIn,
+    session: SessionDep,
+    request: Request,
+    response: Response,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    """按预留单号、计量单位、来源批次、正数数量和截止时间预留原料。"""
+    if not idempotency_key:
+        raise AppError(
+            "IDEMPOTENCY_KEY_REQUIRED",
+            "写操作必须携带 Idempotency-Key 请求头以支持安全重试",
+            400,
+        )
+
+    payload = body.model_dump(mode="json")
+
+    def action() -> tuple[int, dict[str, Any]]:
+        return status.HTTP_201_CREATED, service.create_reservation(session, body)
+
+    code, result = service.idempotent(
+        session,
+        method=request.method,
+        path=request.url.path,
+        key=idempotency_key,
+        payload=payload,
+        action=action,
+    )
+    response.status_code = code
+    return result
+
+
+@router.post(
+    "/reservations/{reservation_no}/cancellation",
+    response_model=ReservationOut,
+    status_code=status.HTTP_200_OK,
+)
+def cancel_reservation(
+    reservation_no: str,
+    session: SessionDep,
+    request: Request,
+    response: Response,
+    body: ReservationCancelIn | None = None,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    """主动取消预留并释放额度；过期/已取消/已核销整笔拒绝。"""
+    if not idempotency_key:
+        raise AppError(
+            "IDEMPOTENCY_KEY_REQUIRED",
+            "写操作必须携带 Idempotency-Key 请求头以支持安全重试",
+            400,
+        )
+
+    payload = body.model_dump(mode="json") if body is not None else {}
+
+    def action() -> tuple[int, dict[str, Any]]:
+        return status.HTTP_200_OK, service.cancel_reservation(
+            session, reservation_no, body
+        )
+
+    code, result = service.idempotent(
+        session,
+        method=request.method,
+        path=request.url.path,
+        key=idempotency_key,
+        payload=payload,
+        action=action,
+    )
+    response.status_code = code
+    return result
 
 
 @router.get("/batches/{batch_no}/lineage", response_model=LineageOut)

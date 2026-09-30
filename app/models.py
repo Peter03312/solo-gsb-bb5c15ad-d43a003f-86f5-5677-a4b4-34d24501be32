@@ -130,6 +130,57 @@ class ProductionCancellation(Base):
     production: Mapped[Production] = relationship(back_populates="cancellation")
 
 
+class MaterialReservation(Base):
+    """原料预留：车间为未来某次生产预先占用某来源批次的指定数量。
+
+    - 预留**不改变实存余量**（batches.remaining_qty），只在“可用量”计算中被扣除；
+      可用量 = 实存余量 - 未取消且未核销且未到期（expires_at > 服务端当前时间）的预留之和。
+    - status 只记录显式生命周期动作（active/cancelled/consumed）；“到期”不落库，
+      一律在读取/核销时按服务端当前时间与 expires_at 比较推导，到期即释放额度，
+      无需后台任务。
+    - 核销（consumed）发生在提交带 reservation_no 的生产事务内：同事务扣减实存、
+      生成产出并把本预留置为 consumed；隔离期间占额度但不得核销，复核放行后
+      仅未到期预留可继续核销。
+    """
+
+    __tablename__ = "material_reservations"
+
+    reservation_no: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source_no: Mapped[str] = mapped_column(
+        String(64), ForeignKey("batches.batch_no"), nullable=False
+    )
+    unit: Mapped[str] = mapped_column(String(16), nullable=False)
+    qty: Mapped[Decimal] = mapped_column(QTY, nullable=False)
+    # UTC 截止时间；PG 为 timestamptz，SQLite 以 UTC naive 文本存储（见 service._store_dt）
+    expires_at: Mapped[object] = mapped_column(DateTime(timezone=True), nullable=False)
+    # active -> cancelled（主动取消/随产出作废自动取消）或 consumed（被生产核销）
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    consumed_production_id: Mapped[int | None] = mapped_column(
+        ForeignKey("productions.id", ondelete="SET NULL"), nullable=True
+    )
+    cancel_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[object] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    cancelled_at: Mapped[object | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    consumed_at: Mapped[object | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    source_batch: Mapped[Batch] = relationship(foreign_keys=[source_no])
+
+    __table_args__ = (
+        CheckConstraint("qty > 0", name="ck_reservation_qty_positive"),
+        CheckConstraint(
+            "status IN ('active', 'cancelled', 'consumed')",
+            name="ck_reservation_status",
+        ),
+        Index("ix_reservation_source_status", "source_no", "status"),
+    )
+
+
 class BatchReview(Base):
     """质检复核记录：确认某疑似批次为误报后撤销其疑似标记。
 

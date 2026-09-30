@@ -125,3 +125,74 @@ def cancellation_not_found(output_no: str) -> AppError:
         404,
         details={"output_batch_no": output_no},
     )
+
+
+# ------------------------------------------------------------- 原料预留
+
+
+def reservation_exists(reservation_no: str) -> AppError:
+    return AppError(
+        "RESERVATION_NO_REUSED",
+        f"预留单号 {reservation_no!r} 已存在，预留单号不得复用",
+        409,
+        details={"reservation_no": reservation_no},
+    )
+
+
+def reservation_not_found(reservation_no: str) -> AppError:
+    return AppError(
+        "RESERVATION_NOT_FOUND",
+        f"预留单 {reservation_no!r} 不存在",
+        404,
+        details={"reservation_no": reservation_no},
+    )
+
+
+def deadline_not_future(expires_at: object) -> AppError:
+    return AppError(
+        "DEADLINE_NOT_FUTURE",
+        f"截止时间 {expires_at!s} 不在未来，预留截止时间必须晚于服务端当前时间",
+        422,
+        details={"expires_at": str(expires_at)},
+    )
+
+
+def insufficient_available(
+    batch_no: str, requested: object, available: object
+) -> AppError:
+    return AppError(
+        "INSUFFICIENT_AVAILABLE",
+        f"批次 {batch_no!r} 可用量不足：本次预留请求 {requested}，当前可用 {available}"
+        "（可用量 = 实存余量 - 未取消且未到期的预留）",
+        409,
+        details={
+            "batch_no": batch_no,
+            "requested": str(requested),
+            "available": str(available),
+        },
+    )
+
+
+def reservation_not_active(reservation_no: str, status: str) -> AppError:
+    return AppError(
+        "RESERVATION_NOT_ACTIVE",
+        f"预留单 {reservation_no!r} 当前状态为 {status!r}，"
+        "只有未取消、未核销且未到期的预留可取消/核销",
+        409,
+        details={"reservation_no": reservation_no, "status": status},
+    )
+
+
+def reservation_mismatch(reservation_no: str, field: str, expected: object, actual: object) -> AppError:
+    return AppError(
+        "RESERVATION_MISMATCH",
+        f"投料与预留单 {reservation_no!r} 不一致：{field} 应为 {expected!s}，实际为 {actual!s}；"
+        "按预留投料时，投料批次、数量和单位须与预留完全一致",
+        422,
+        details={
+            "reservation_no": reservation_no,
+            "field": field,
+            "expected": str(expected),
+            "actual": str(actual),
+        },
+    )

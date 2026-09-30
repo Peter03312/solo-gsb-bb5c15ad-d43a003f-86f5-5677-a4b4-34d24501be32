@@ -2,7 +2,10 @@
 
 面向小型食品加工厂的**本地批次追溯服务**：登记原料批次、记录生产投料与产出、
 查询批次余量与上下游谱系、在发现疑似污染批次时找出并隔离全部后代产出，并支持在
-生产单录入错误时**撤销单据、同事务返还各来源原投料量**（产出作废、原单据留存可查）。
+生产单录入错误时**撤销单据、同事务返还各来源原投料量**（产出作废、原单据留存可查）；
+车间还可按**预留单号、计量单位、来源批次、正数数量与截止时间预留原料**，查询预留状态
+与各批次**可用量**，并主动取消预留——预留不动实存，普通生产只能消耗可用量，
+提交生产时可凭预留单号在同一事务内**核销预留、扣减实存、生成产出**。
 
 - 语言/框架：Python 3.12 + FastAPI + SQLAlchemy 2
 - 关系数据库：PostgreSQL 16（Docker Compose 一键启动）；无数据库时自动回退本地 SQLite 文件库
@@ -78,14 +81,18 @@ compose 的端口映射：宿主机 `8080` → 容器 `8080`，可在 `docker-co
 | --- | --- | --- |
 | GET | `/health` | 健康检查 |
 | POST | `/raw-batches` | 登记一个原料批次及初始数量 |
-| POST | `/productions` | 提交一次生产：多批次投入 → 一个产出批次 |
+| POST | `/productions` | 提交一次生产：多批次投入 → 一个产出批次（可填 `reservation_no` 按预留核销投料） |
 | GET | `/productions/{output_batch_no}` | 查询生产单原单据、投料明细与撤销状态 |
 | POST | `/productions/{output_batch_no}/cancellation` | 撤销录入错误的生产单，返还原投料量并作废产出 |
 | GET | `/productions/{output_batch_no}/cancellation` | 查询撤销结果（返还明细、撤销原因与时间） |
-| GET | `/batches/{batch_no}` | 查询批次余量与状态 |
+| GET | `/batches/{batch_no}` | 查询批次实存余量、预留合计与可用量及状态 |
 | GET | `/batches/{batch_no}/lineage` | 查询上下游谱系（递归，仅含未撤销边） |
 | POST | `/contamination` | 标记疑似污染批次，返回并隔离全部后代 |
 | POST | `/reviews` | 质检复核确认误报：撤销疑似标记并重算隔离 |
+| POST | `/reservations` | 预留原料（预留单号、来源批次、单位、正数数量、截止时间） |
+| GET | `/reservations/{reservation_no}` | 查询单笔预留状态与来源批次当前可用量 |
+| GET | `/batches/{batch_no}/reservations` | 查询某来源批次的全部预留（各状态）与额度汇总 |
+| POST | `/reservations/{reservation_no}/cancellation` | 主动取消预留（无请求体亦可），立即释放额度 |
 
 ### 业务规则
 
@@ -123,6 +130,33 @@ compose 的端口映射：宿主机 `8080` → 容器 `8080`，可在 `docker-co
    产出与全部来源沿用编号升序的同一加锁顺序。因此撤销与投料、污染标记、复核任意并发，
    结果都等价于某一串行顺序——不会超用余量、不会误放行隔离批次，也不会出现“既撤销又投料”；
    隔离批次绝不会被投料。
+10. **原料预留（本轮新增）**：
+    - `POST /reservations` 按**预留单号、计量单位、来源批次、正数数量和截止时间**预留原料。
+      **预留不改变实存余量**；可用量 = 实存余量 − **未取消、未核销且未到期**的预留合计。
+      **普通生产只能消耗可用量**；预留可叠加，用尽可用量后的新预留整笔拒绝，**无部分预留**。
+    - 预留编号重复报 `RESERVATION_NO_REUSED`(409)；来源不存在报 `SOURCE_NOT_FOUND`(404)；
+      单位不符报 `UNIT_MISMATCH`(422)；可用量不足报 `INSUFFICIENT_AVAILABLE`(409)；
+      截止时间不晚于服务端当前时间报 `DEADLINE_NOT_FUTURE`(422)；对已作废产出预留报
+      `BATCH_CANCELLED`(409)。**隔离批次仍可预留**（隔离只禁核销、不禁占额度）。
+    - 提交生产时可选填 `reservation_no`：**投料批次、数量和单位须与预留完全一致，且只能有
+      一笔投料**；在**同一事务内核销预留（active→consumed）、扣减实存、生成产出**。
+      预留不存在报 `RESERVATION_NOT_FOUND`(404)；预留已过期/已取消/已核销报
+      `RESERVATION_NOT_ACTIVE`(409)；来源已隔离报 `BATCH_QUARANTINED`(409)、来源已作废报
+      `BATCH_CANCELLED`(409)；批次/数量/单位/投料笔数与预留不符报 `RESERVATION_MISMATCH`/
+      `UNIT_MISMATCH`(422)。任一不符**整笔拒绝、不占用产出编号**。
+    - **隔离期间预留仍占额度但不得核销**；经 `POST /reviews` 复核放行后，**仅未到期**预留可
+      继续核销，已到期的按过期拒绝（额度已释放）。
+    - **到期按服务端时间（UTC）即时判定并释放额度**：到期不做后台扫描、不改写记录，
+      查询与核销时按当前时间与 `expires_at` 比较，状态呈现为 `expired`；到期预留不能再取消
+      或核销，其额度已可被普通生产使用。
+    - `POST /reservations/{no}/cancellation` 主动取消未到期预留并立即释放额度（请求体可空，
+      可带 `{"reason": "..."}`）；过期/已取消/已核销报 `RESERVATION_NOT_ACTIVE`(409)。
+    - 撤销生产单作废其产出时，该产出上**仍占额度的预留**在同一事务内**自动取消**
+      （已核销/已取消的不动），保证作废批次可用量不为负。
+    - 并发预留与投料沿用“先按编号升序锁批次行、再锁预留行”的统一加锁顺序：并发预留、
+      普通投料与按预留核销任意并发，**可用量绝不会为负**；同一预留的“核销”与“取消/再次核销”
+      并发时恰一方成功，结局等价于某一串行顺序。
+    - 预留写操作同样要求 `Idempotency-Key`，沿用同键同体重放、异体 `409` 冲突约定。
 
 ### 错误响应格式
 
@@ -136,6 +170,10 @@ compose 的端口映射：宿主机 `8080` → 容器 `8080`，可在 `docker-co
 `PRODUCTION_NOT_FOUND`(404)、`PRODUCTION_ALREADY_CANCELLED`(409)、`OUTPUT_SUSPECT`(409)、
 `OUTPUT_HAS_REVIEW`(409)、`OUTPUT_ALREADY_CONSUMED`(409)、`BATCH_CANCELLED`(409)、
 `CANCELLATION_NOT_FOUND`(404)。
+
+预留相关错误码：`RESERVATION_NO_REUSED`(409)、`RESERVATION_NOT_FOUND`(404)、
+`INSUFFICIENT_AVAILABLE`(409)、`DEADLINE_NOT_FUTURE`(422)、
+`RESERVATION_NOT_ACTIVE`(409)、`RESERVATION_MISMATCH`(422)。
 
 ---
 
@@ -378,6 +416,132 @@ curl -i -X POST http://localhost:8080/productions \
 # HTTP/1.1 409 ... INSUFFICIENT_BALANCE；MIX-X 未创建，RM-A 余量仍为 60
 ```
 
+### 10. 预留原料（不动实存，只占可用量）
+
+为明天上午的一批生产预先锁定 `RM-A` 的 30kg：
+
+```bash
+curl -X POST http://localhost:8080/reservations \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: rsv-rm-a-20261001-01' \
+  -d '{
+        "reservation_no": "RSV-20261001-01",
+        "source_batch_no": "RM-A",
+        "unit": "kg",
+        "quantity": 30,
+        "expires_at": "2026-10-01T12:00:00+08:00"
+      }'
+```
+
+```json
+{
+  "reservation_no": "RSV-20261001-01",
+  "source_batch_no": "RM-A",
+  "unit": "kg",
+  "quantity": 30.0,
+  "expires_at": "2026-10-01T04:00:00Z",
+  "status": "active",
+  "created_at": "2026-09-30T22:10:00Z",
+  "cancelled_at": null,
+  "cancel_reason": null,
+  "consumed_at": null,
+  "consumed_by_output_no": null,
+  "source": {
+    "batch_no": "RM-A", "unit": "kg",
+    "remaining_qty": 100.0, "reserved_qty": 30.0, "available_qty": 70.0,
+    "is_quarantined": false
+  }
+}
+```
+
+- `expires_at` 接受 ISO 8601 时间（建议带时区；不带时区按 UTC 解释），必须**严格晚于
+  服务端当前时间**，否则 `422 DEADLINE_NOT_FUTURE`。
+- `GET /batches/RM-A` 现同时返回 `remaining_qty`（实存）、`reserved_qty`（未取消/未核销/
+  未到期预留合计）与 `available_qty`（可用量）；既有字段保持不变。
+
+```bash
+# 查询单笔预留状态
+curl http://localhost:8080/reservations/RSV-20261001-01
+
+# 查询某来源批次的全部预留（active/expired/cancelled/consumed）与额度汇总
+curl http://localhost:8080/batches/RM-A/reservations
+```
+
+预留之后**普通生产只能消耗可用量**（70kg），不影响实存：
+
+```bash
+# 请求 71kg：409 INSUFFICIENT_BALANCE（消息中给出可用量口径），实存与预留都不变
+curl -i -X POST http://localhost:8080/productions \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: p-71' \
+  -d '{"output_batch_no":"MIX-9","unit":"kg","output_quantity":71,
+       "inputs":[{"batch_no":"RM-A","quantity":71}]}'
+```
+
+登记预留的拒绝情形（整笔拒绝、无部分预留）：
+
+```bash
+# 预留编号重复      -> 409 RESERVATION_NO_REUSED
+# 来源批次不存在    -> 404 SOURCE_NOT_FOUND
+# 单位与批次不符    -> 422 UNIT_MISMATCH
+# 数量非正          -> 422 VALIDATION_ERROR
+# 截止时间不在未来  -> 422 DEADLINE_NOT_FUTURE
+# 可用量不足        -> 409 INSUFFICIENT_AVAILABLE
+# 来源是已作废产出  -> 409 BATCH_CANCELLED
+```
+
+### 11. 按预留提交生产（同事务核销预留、扣减实存、生成产出）
+
+```bash
+curl -X POST http://localhost:8080/productions \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: prod-rsv-20261001-01' \
+  -d '{
+        "output_batch_no": "MIX-7",
+        "unit": "kg",
+        "output_quantity": 30,
+        "inputs": [{"batch_no": "RM-A", "quantity": 30}],
+        "reservation_no": "RSV-20261001-01"
+      }'
+```
+
+成功后同一事务内：`RM-A` 实存 100 → 70、预留 `active` → `consumed`
+（`consumed_by_output_no = MIX-7`）、产出 `MIX-7` 已创建；预留不再占用额度。
+投料**批次、数量、单位**必须与预留**完全一致**且只能有一笔投料：
+
+```bash
+# 预留不存在          -> 404 RESERVATION_NOT_FOUND（产出编号不被占用）
+# 预留已取消/已核销   -> 409 RESERVATION_NOT_ACTIVE
+# 预留已到期          -> 409 RESERVATION_NOT_ACTIVE（额度已按服务端时间释放）
+# 来源批次已隔离      -> 409 BATCH_QUARANTINED（隔离期间占额度但不得核销）
+# 来源批次已作废      -> 409 BATCH_CANCELLED
+# 投料批次/数量/笔数
+#   与预留不一致      -> 422 RESERVATION_MISMATCH
+# 投料单位不一致      -> 422 UNIT_MISMATCH
+```
+
+隔离/复核与到期的交互：`RM-A` 在预留后被标记疑似时，预留**仍占额度**（普通生产同样不能
+动用这 30kg），但按预留核投料会被 `BATCH_QUARANTINED` 拒绝；经复核放行后，**仍未到期**
+的预留可正常核销；若放行时已过 `expires_at`，则该预留已自动失去额度（状态 `expired`），
+核销以 `RESERVATION_NOT_ACTIVE` 拒绝，这 30kg 已回到可用量中可供普通生产使用。
+
+### 12. 主动取消预留与到期释放
+
+```bash
+# 请求体可省略；也可带 {"reason": "排产调整，本批改投 RM-B"}
+curl -X POST http://localhost:8080/reservations/RSV-20261001-01/cancellation \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: cancel-rsv-20261001-01' \
+  -d '{"reason":"排产调整，本批改投 RM-B"}'
+```
+
+成功返回预留最新状态（`cancelled` + `cancelled_at` + `cancel_reason`），额度立即释放，
+`GET /batches/RM-A` 的 `available_qty` 回升；对已取消预留再次操作返回
+`409 RESERVATION_NOT_ACTIVE`，对已核销/已到期预留取消同样如此。取消接口与其它写操作一样
+要求 `Idempotency-Key`，同键同体重放返回首次结果、异体冲突返回 `409 IDEMPOTENCY_CONFLICT`。
+
+**到期不需要任何操作**：到期判定一律以**服务端当前时间（UTC）**为准，查询时状态显示为
+`expired`，`reserved_qty` 即时不再计入该笔，额度自动释放给普通生产；到期记录保留可查。
+
 ---
 
 ## 五、项目结构
@@ -387,14 +551,15 @@ app/
   config.py       # 环境变量配置
   db.py           # 引擎/会话、SQLite 写锁与 PG 行锁支撑、建表
   models.py       # batches / productions / production_inputs / production_cancellations /
-                  # batch_reviews / idempotency_keys
-  schemas.py      # Pydantic 请求响应模型（正数、定点数校验）
+                  # batch_reviews / material_reservations / idempotency_keys
+  schemas.py      # Pydantic 请求响应模型（正数、定点数、截止时间校验）
   errors.py       # 业务错误码
-  service.py      # 核心逻辑：登记、生产事务、撤销返还、幂等、递归有效谱系、污染传播、复核重算
+  service.py      # 核心逻辑：登记、预留与可用量、生产事务（含预留核销）、撤销返还、幂等、
+                  # 递归有效谱系、污染传播、复核重算
   routes.py       # HTTP 路由
   main.py         # FastAPI 应用与异常处理
   entrypoint.py   # 容器入口：等待数据库 → 建表 → 启动
-tests/            # 端到端 + 并发测试（59 个用例）
+tests/            # 端到端 + 并发测试（100 个用例，含预留专项 41 个）
 Dockerfile
 docker-compose.yml
 ```
@@ -417,9 +582,20 @@ docker-compose.yml
   - 撤销返还只增加来源余量且在锁内完成，不会超用余量；隔离批次不可能被误投料；
   - 撤销边即时退出有效谱系，标记/复核重算隔离时不会沿已撤销边传播。
 - 幂等记录与业务数据在同一事务内落库，唯一约束 `(method, path, key)` 兜底并发首请求竞争。
+- 预留并发沿用同一套加锁纪律：预留登记 / 普通投料 / 按预留核销都先按编号升序锁批次行，
+  再锁预留行，因此
+  - 并发预留同一批次时以行锁串行，合计占用绝不超过实存（可用量不为负）；
+  - 预留登记与普通投料并发时，占用额度与扣减实存在同一锁上裁决，
+    `20×预留成功数 + 20×投料成功数 ≤ 实存`；
+  - 同一预留的“核销”与“取消”、以及两笔“核销”并发时，恰一笔成功，另一笔以
+    `RESERVATION_NOT_ACTIVE` 拒绝，不会既核销又取消、也不会重复扣减；
+  - 到期额度按服务端时间在加锁后的读取点上即时计算，无需后台扫描或状态迁移。
 
-> 注：新表 `batch_reviews` 与 `production_cancellations` 随启动/入口的
-> `CREATE TABLE IF NOT EXISTS` 自动创建，既有数据库升级无需手工迁移；
+> 注：新表 `batch_reviews`、`production_cancellations` 与 `material_reservations`
+> 随启动/入口的 `CREATE TABLE IF NOT EXISTS` 自动创建，既有数据库升级无需手工迁移；
 > 现有登记、生产、污染标记、复核、批次/谱系查询接口的请求、响应与启动方式保持不变。
 > 兼容性补充：`GET /batches/{batch_no}` 响应新增 `is_cancelled` 字段（原料批次与
-> 未撤销产出恒为 `false`），谱系查询仅过滤已撤销边，未撤销数据的行为与字段取值不变。
+> 未撤销产出恒为 `false`）、`available_qty` 与 `reserved_qty` 字段（无预留时分别等于
+> `remaining_qty` 与 `0`），谱系查询仅过滤已撤销边，其余既有字段取值不变；
+> `POST /productions` 请求新增可选字段 `reservation_no`（不带时行为与此前完全一致）。
+> 既有不带预留的生产、撤销返还、批次与谱系查询请求/响应保持兼容。
