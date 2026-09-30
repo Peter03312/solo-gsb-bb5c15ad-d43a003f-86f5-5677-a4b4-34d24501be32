@@ -151,6 +151,59 @@ class BatchReview(Base):
     batch: Mapped[Batch] = relationship(foreign_keys=[batch_no])
 
 
+class MaterialReservation(Base):
+    """原料预留：车间在实际投料前预占某来源批次的指定数量/单位。
+
+    预留不改变批次实存余量（remaining_qty）；可用量 = 实存 - 所有
+    “未取消、未核销、未到期”预留量之和。普通生产只能消耗可用量。
+
+    生命周期状态（status）：
+    - active：有效，占用额度（未取消、未核销、且 expires_at 仍在服务端当前时间之后）；
+    - consumed：已在某生产事务内与扣减实存、生成产出同事务核销，永久不再占用额度；
+    - cancelled：经主动取消接口取消（cancel_reason 为操作员填写），或随其关联
+      生产单撤销而由系统自动恢复（cancel_reason 以 “SYSTEM:” 前缀标记）。
+
+    到期不落库状态：expires_at <= 服务端当前时间即视为过期、额度自动释放，
+    由所有读取/计算点按时间动态判定。
+    """
+
+    __tablename__ = "material_reservations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    reservation_no: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    source_no: Mapped[str] = mapped_column(
+        String(64), ForeignKey("batches.batch_no"), nullable=False
+    )
+    unit: Mapped[str] = mapped_column(String(16), nullable=False)
+    qty: Mapped[Decimal] = mapped_column(QTY, nullable=False)
+    expires_at: Mapped[object] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    # 取消/系统恢复原因；active 与 consumed 状态为 None
+    cancel_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[object] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    cancelled_at: Mapped[object | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 核销该预留的生产单产出编号（消费后回填）
+    consumed_by_output_no: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("batches.batch_no"), nullable=True
+    )
+
+    source_batch: Mapped[Batch] = relationship(foreign_keys=[source_no])
+
+    __table_args__ = (
+        CheckConstraint("qty > 0", name="ck_reservation_qty_positive"),
+        CheckConstraint(
+            "status IN ('active', 'consumed', 'cancelled')",
+            name="ck_reservation_status",
+        ),
+        Index("ix_reservation_source", "source_no"),
+        Index("ix_reservation_status_expires", "status", "expires_at"),
+    )
+
+
 class IdempotencyKey(Base):
     """请求幂等记录。
 

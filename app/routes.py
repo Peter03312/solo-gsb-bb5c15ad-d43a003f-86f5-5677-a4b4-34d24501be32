@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Header, Request, Response, status
+from fastapi import APIRouter, Header, Query, Request, Response, status
 from sqlalchemy.orm import Session
 
 from . import service
@@ -20,6 +20,10 @@ from .schemas import (
     ProductionIn,
     ProductionOut,
     RawBatchIn,
+    ReservationCancelIn,
+    ReservationIn,
+    ReservationListOut,
+    ReservationOut,
     ReviewIn,
     ReviewOut,
     SuspectIn,
@@ -28,12 +32,19 @@ from .schemas import (
 router = APIRouter()
 
 
-def _batch_out(batch: Batch, cancelled: bool = False) -> dict[str, Any]:
+def _batch_out(batch: Batch, cancelled: bool = False, *, session: Session | None = None) -> dict[str, Any]:
+    reserved = available = 0.0
+    if session is not None:
+        reserved_dec, available_dec = service.batch_availability(session, batch)
+        reserved = float(reserved_dec)
+        available = float(available_dec)
     return {
         "batch_no": batch.batch_no,
         "unit": batch.unit,
         "initial_qty": float(batch.initial_qty),
         "remaining_qty": float(batch.remaining_qty),
+        "reserved_qty": reserved,
+        "available_qty": available,
         "is_suspect": batch.is_suspect,
         "is_quarantined": batch.is_quarantined,
         "is_cancelled": cancelled,
@@ -77,7 +88,7 @@ def create_raw_batch(
 
     def action() -> tuple[int, dict[str, Any]]:
         batch = service.register_raw_batch(session, body)
-        return status.HTTP_201_CREATED, _batch_out(batch)
+        return status.HTTP_201_CREATED, _batch_out(batch, session=session)
 
     code, result = service.idempotent(
         session,
@@ -187,7 +198,90 @@ def get_batch(batch_no: str, session: SessionDep) -> dict[str, Any]:
 
         raise batch_not_found(batch_no)
     cancelled = batch_no in service.cancelled_output_nos(session, [batch_no])
-    return _batch_out(batch, cancelled)
+    return _batch_out(batch, cancelled, session=session)
+
+
+@router.get("/reservations", response_model=ReservationListOut)
+def list_reservations(
+    session: SessionDep,
+    source_batch_no: str | None = Query(default=None, max_length=64),
+) -> dict[str, Any]:
+    """列出预留单（可按来源批次过滤），状态按服务端当前时间动态计算。"""
+    return service.list_reservations(session, source_batch_no)
+
+
+@router.post("/reservations", response_model=ReservationOut, status_code=status.HTTP_201_CREATED)
+def create_reservation(
+    body: ReservationIn,
+    session: SessionDep,
+    request: Request,
+    response: Response,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    """预留原料：不改变实存，仅占用可用量；编号重复/来源不存在/单位不符/
+    可用量不足/截止时间不在未来时整笔拒绝。"""
+    if not idempotency_key:
+        raise AppError(
+            "IDEMPOTENCY_KEY_REQUIRED",
+            "写操作必须携带 Idempotency-Key 请求头以支持安全重试",
+            400,
+        )
+
+    payload = body.model_dump(mode="json")
+
+    def action() -> tuple[int, dict[str, Any]]:
+        return status.HTTP_201_CREATED, service.create_reservation(session, body)
+
+    code, result = service.idempotent(
+        session,
+        method=request.method,
+        path=request.url.path,
+        key=idempotency_key,
+        payload=payload,
+        action=action,
+    )
+    response.status_code = code
+    return result
+
+
+@router.get("/reservations/{reservation_no}", response_model=ReservationOut)
+def get_reservation(reservation_no: str, session: SessionDep) -> dict[str, Any]:
+    """查询预留状态，以及来源批次当前实存、有效预留量与可用量。"""
+    return service.get_reservation(session, reservation_no)
+
+
+@router.post("/reservations/{reservation_no}/cancellation", response_model=ReservationOut)
+def cancel_reservation(
+    reservation_no: str,
+    body: ReservationCancelIn,
+    session: SessionDep,
+    request: Request,
+    response: Response,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    """主动取消预留并释放额度；过期/已取消/已核销均拒绝。"""
+    if not idempotency_key:
+        raise AppError(
+            "IDEMPOTENCY_KEY_REQUIRED",
+            "写操作必须携带 Idempotency-Key 请求头以支持安全重试",
+            400,
+        )
+
+    payload = body.model_dump(mode="json")
+
+    def action() -> tuple[int, dict[str, Any]]:
+        return status.HTTP_200_OK, service.cancel_reservation(session, reservation_no, body)
+
+    code, result = service.idempotent(
+        session,
+        method=request.method,
+        path=request.url.path,
+        key=idempotency_key,
+        payload=payload,
+        action=action,
+    )
+    response.status_code = code
+    return result
 
 
 @router.get("/batches/{batch_no}/lineage", response_model=LineageOut)
